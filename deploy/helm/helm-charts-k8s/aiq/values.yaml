@@ -20,6 +20,10 @@ project:
 # OPTIONAL: Namespace Configuration
 # ==========================================
 namespace:
+  # Namespace for all chart resources. Empty uses the release namespace
+  # (helm install -n <ns> / .Release.Namespace), which is required for GitOps
+  # operators such as ArgoCD and Fleet. Set to pin a specific namespace.
+  name: ""
   create: false  # Set to true to create namespace (useful for ArgoCD)
   labels: {}  # Additional custom labels
   annotations:
