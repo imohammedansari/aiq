@@ -53,6 +53,7 @@ from aiq_agent.common.data_source_registry import get_source_id_for_tool
 from nat.builder.framework_enum import LLMFrameworkEnum
 
 from ..jobs.access import require_verified_principal
+from ..mcp_auth.models import PerUserAuthInfo
 from ..registry import AGENT_REGISTRY
 from ..registry import get_agent_config
 
@@ -61,6 +62,13 @@ if TYPE_CHECKING:
     from nat.front_ends.fastapi.fastapi_front_end_plugin_worker import FastApiFrontEndPluginWorker
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_artifact_store(db_url: str) -> None:
+    """Validate configured artifact storage during API startup."""
+    from aiq_agent.agents.deep_researcher.sandbox.artifacts import build_artifact_store
+
+    build_artifact_store(db_url).validate()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -226,6 +234,18 @@ async def _get_agent_available_source_ids(builder: WorkflowBuilder, agent_config
         sid = get_source_id_for_tool(name)
         if sid is not None:
             source_ids.add(sid)
+
+    # Per-user MCP sources (e.g. Google Drive) contribute NO static tools — their
+    # tools are resolved per-user at run time by open_per_user_mcp_tools, so they
+    # never appear in the loop above. Treat a configured protected source as an
+    # available runtime candidate so submit validation doesn't 422 it; connectivity
+    # is enforced separately by the MCP auth preflight (409 mcp_auth_required).
+    from aiq_agent.common.data_source_registry import get_all_sources
+
+    for source in get_all_sources():
+        pua = source.per_user_auth
+        if pua is not None and pua.required:
+            source_ids.add(source.id)
     return sorted(source_ids)
 
 
@@ -305,6 +325,24 @@ async def _validate_data_sources_for_agent(
             "known_ids": known_ids,
         },
     )
+
+
+async def _preflight_mcp_auth(provider, principal, data_sources: list[str] | None):
+    """Return a 409 JSONResponse if any selected protected source is not connected, else None.
+
+    Thin HTTP wrapper over the shared :func:`evaluate_mcp_auth`; the same check
+    runs inside ``submit_agent_job`` (raising instead) so programmatic submitters
+    cannot bypass it. Source existence is validated earlier by
+    ``_validate_data_sources_for_agent``.
+    """
+    from fastapi.responses import JSONResponse
+
+    from ..mcp_auth.preflight import evaluate_mcp_auth
+
+    body = await evaluate_mcp_auth(provider, principal, data_sources)
+    if body is None:
+        return None
+    return JSONResponse(status_code=409, content=body.model_dump(mode="json"))
 
 
 class JobStatusResponse(BaseModel):
@@ -411,7 +449,15 @@ class DataSource(BaseModel):
     id: str = Field(..., description="Unique identifier for the data source")
     name: str = Field(..., description="Display name")
     description: str | None = Field(default=None, description="Human-readable description")
+    default_enabled: bool = Field(
+        default=True,
+        description="Whether the source is toggled on by default in the UI (from registry metadata)",
+    )
     requires_auth: bool = Field(default=False, description="Whether user authentication is required")
+    per_user_auth: PerUserAuthInfo | None = Field(
+        default=None,
+        description="Per-user MCP OAuth state for a protected source (omitted for unprotected sources)",
+    )
 
 
 async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: FastApiFrontEndPluginWorker) -> None:
@@ -436,6 +482,21 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
     from ..jobs.report_context import to_initial_files
     from ..jobs.submit import JobIdConflictError
     from ..jobs.submit import submit_agent_job as submit_authorized_job
+    from ..mcp_auth.factory import build_mcp_auth_provider
+    from ..mcp_auth.preflight import McpAuthRequiredError
+    from ..mcp_auth.serialize import build_listing_auth_info
+    from .auth import register_mcp_auth_routes
+
+    # Per-user MCP auth control plane. The provider is shared by the data-source
+    # listing, the status/connect/callback routes, and submit preflight so a flow
+    # started via /connect can be completed by /callback in the same process.
+    mcp_auth_provider = await build_mcp_auth_provider(builder)
+    # Publish the provider process-wide so submit_agent_job() can run the same
+    # connect-state preflight for programmatic submitters, not just this REST route.
+    from ..mcp_auth.active import set_active_mcp_auth_provider
+
+    set_active_mcp_auth_provider(mcp_auth_provider)
+    register_mcp_auth_routes(app, mcp_auth_provider)
 
     if not get_all_sources():
         logger.warning(
@@ -467,16 +528,22 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         summary="List data sources",
     )
     async def list_data_sources() -> list[DataSource]:
-        """List available data sources dynamically from the registry."""
-        return [
-            DataSource(
-                id=source.id,
-                name=source.name,
-                description=source.description,
-                requires_auth=source.requires_auth,
+        """List available data sources, including the current user's per-source auth state."""
+        principal = require_verified_principal()
+        sources = []
+        for source in get_all_sources():
+            per_user_auth = await build_listing_auth_info(mcp_auth_provider, principal, source)
+            sources.append(
+                DataSource(
+                    id=source.id,
+                    name=source.name,
+                    description=source.description,
+                    default_enabled=source.default_enabled,
+                    requires_auth=source.requires_auth,
+                    per_user_auth=per_user_auth,
+                )
             )
-            for source in get_all_sources()
-        ]
+        return sources
 
     logger.info("Registered /v1/data_sources and /v1/jobs/async/agents routes")
 
@@ -509,7 +576,9 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         db_url[:50],
         default_expiry_seconds,
     )
-    await asyncio.get_running_loop().run_in_executor(None, ensure_job_access_table, db_url)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, ensure_job_access_table, db_url)
+    await loop.run_in_executor(None, _validate_artifact_store, db_url)
 
     @app.get("/health", tags=["health"], summary="Health check")
     async def health_check():
@@ -549,7 +618,12 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         ),
         responses={
             400: {"description": "Unknown agent type or invalid request"},
-            409: {"description": "A custom job_id was supplied that collides with an existing job"},
+            409: {
+                "description": (
+                    "A custom job_id was supplied that collides with an existing job, or a selected "
+                    "protected data source requires per-user OAuth connection"
+                )
+            },
             422: {"description": "One or more unknown or agent-unavailable data source IDs"},
             500: {"description": "Failed to persist async job authorization metadata"},
             503: {"description": "Dask scheduler not available"},
@@ -591,6 +665,13 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
         if _sandbox_caps_configured() and _agent_uses_sandbox(builder, agent_config.config_name):
             await _enforce_sandbox_concurrency(db_url, principal)
 
+        # Preflight protected MCP sources: block before enqueue if a selected
+        # protected source is not connected. When data_sources is None the job
+        # may use any tool, so every protected source must be connected.
+        mcp_block = await _preflight_mcp_auth(mcp_auth_provider, principal, req.data_sources)
+        if mcp_block is not None:
+            return mcp_block
+
         # Propagate auth token to Dask worker for requires_auth data sources
         from aiq_agent.auth import get_auth_token
 
@@ -608,6 +689,14 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
             )
         except JobIdConflictError:
             raise HTTPException(409, f"Job already exists: {req.job_id}")
+        except McpAuthRequiredError as e:
+            # submit_agent_job runs the same MCP preflight and raises if a selected
+            # protected source became disconnected between the route preflight above
+            # and enqueue. Surface the SAME 409 mcp_auth_required contract instead of
+            # letting it fall through to the generic 500 handler.
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=409, content=e.response.model_dump(mode="json"))
         except RuntimeError as e:
             # The principal is resolved above, so a RuntimeError here is an
             # availability/config failure (e.g. scheduler not configured), not an
@@ -818,12 +907,12 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
     )
     async def list_job_artifacts(job_id: str) -> dict:
         """List durable artifact metadata for a job (no bytes)."""
-        from aiq_agent.agents.deep_researcher.sandbox.artifacts import SqlArtifactStore
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import build_artifact_store
 
         principal = require_verified_principal()
         await authorize_job_access(job_store, db_url, job_id, principal)
 
-        store = SqlArtifactStore(db_url)
+        store = build_artifact_store(db_url)
         artifacts = await asyncio.to_thread(store.list, job_id)
         # Exclude storage internals (storage_uri embeds the db_url, which may carry
         # credentials/hostnames; sandbox_path is an internal layout detail) from the
@@ -842,12 +931,12 @@ async def register_job_routes(app: FastAPI, builder: WorkflowBuilder, worker: Fa
     )
     async def get_job_artifact_content(job_id: str, artifact_id: str) -> StreamingResponse:
         """Stream an artifact's bytes (auth-scoped to the owning job)."""
-        from aiq_agent.agents.deep_researcher.sandbox.artifacts import SqlArtifactStore
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import build_artifact_store
 
         principal = require_verified_principal()
         await authorize_job_access(job_store, db_url, job_id, principal)
 
-        store = SqlArtifactStore(db_url)
+        store = build_artifact_store(db_url)
         artifact = await asyncio.to_thread(store.get, job_id, artifact_id)
         if artifact is None:
             raise HTTPException(404, f"Artifact not found: {artifact_id}")
@@ -1188,10 +1277,10 @@ async def _run_event_cleanup(db_url: str, retention_seconds: int, is_postgres: b
     # Artifact retention shares the job expiry boundary (best-effort; the artifacts
     # table only exists when artifact capture has been used).
     try:
-        from aiq_agent.agents.deep_researcher.sandbox.artifacts import SqlArtifactStore
+        from aiq_agent.agents.deep_researcher.sandbox.artifacts import build_artifact_store
 
         artifacts_deleted = await loop.run_in_executor(
-            None, lambda: SqlArtifactStore(db_url).cleanup_old_artifacts(retention_seconds)
+            None, lambda: build_artifact_store(db_url).cleanup_old_artifacts(retention_seconds)
         )
         if artifacts_deleted:
             logger.info("Artifact cleanup: %d old artifacts removed", artifacts_deleted)
@@ -1436,6 +1525,7 @@ async def _sse_generator_postgres(job_store, job_id: str, db_url: str, start_eve
     Achieves sub-10ms latency compared to 500ms polling interval.
     """
     import asyncio
+    import time
 
     import asyncpg
 
@@ -1450,6 +1540,12 @@ async def _sse_generator_postgres(job_store, job_id: str, db_url: str, start_eve
     sequence_id = start_event_id
     terminal_statuses = {JobStatus.SUCCESS.value, JobStatus.FAILURE.value, JobStatus.INTERRUPTED.value}
     is_reconnect = start_event_id > 0
+    # Emit an SSE keepalive comment after this many seconds of silence so an
+    # upstream idle timeout (OpenShift router / edge / proxy) never closes the
+    # connection. job.heartbeat only starts once the worker runs, so it does not
+    # cover worker cold-start on the first request — this keepalive does.
+    SSE_KEEPALIVE_INTERVAL = 15.0
+    last_keepalive = time.monotonic()
 
     def format_sse(event_type: str, data: dict, event_id: int | None = None) -> str:
         """Format an SSE frame and advance (or set) the monotonic event sequence id."""
@@ -1560,6 +1656,13 @@ async def _sse_generator_postgres(job_store, job_id: str, db_url: str, start_eve
                                 last_event_id = db_event_id
                             event_type = event.pop("type", "event")
                             yield format_sse(event_type, event, db_event_id)
+                        # Keepalive during silent periods (e.g. worker cold-start) so an
+                        # upstream idle timeout never closes the connection.
+                        if fallback_events:
+                            last_keepalive = time.monotonic()
+                        elif (time.monotonic() - last_keepalive) >= SSE_KEEPALIVE_INTERVAL:
+                            last_keepalive = time.monotonic()
+                            yield ": keepalive\n\n"
 
                     job = await job_store.get_job(job_id)
                     if not job:
@@ -1624,6 +1727,7 @@ async def _sse_generator_polling(job_store, job_id: str, db_url: str, start_even
     Supports graceful shutdown via the SSE connection manager.
     """
     import asyncio
+    import time
 
     from nat.front_ends.fastapi.async_jobs.job_store import JobStatus
 
@@ -1638,6 +1742,11 @@ async def _sse_generator_polling(job_store, job_id: str, db_url: str, start_even
     is_reconnect = start_event_id > 0
     in_replay_mode = True
     replay_mode_announced = False
+    # Emit an SSE keepalive comment after this many seconds of silent live polling
+    # so an upstream idle timeout never closes the connection (e.g. during worker
+    # cold-start, before the first event or 30s heartbeat arrives).
+    SSE_KEEPALIVE_INTERVAL = 15.0
+    last_keepalive = time.monotonic()
 
     def format_sse(event_type: str, data: dict, event_id: int | None = None) -> str:
         """Format an SSE frame and advance (or set) the monotonic event sequence id."""
@@ -1677,6 +1786,7 @@ async def _sse_generator_polling(job_store, job_id: str, db_url: str, start_even
                 events = await EventStore.get_events_async(db_url, job_id, last_event_id, limit)
 
                 if events:
+                    last_keepalive = time.monotonic()
                     logger.info(f"SSE: Fetched {len(events)} events for job {job_id} (after_id={last_event_id})")
                 elif job.status in terminal_statuses:
                     logger.warning(f"SSE: No events found for completed job {job_id} (after_id={last_event_id})")
@@ -1731,6 +1841,12 @@ async def _sse_generator_polling(job_store, job_id: str, db_url: str, start_even
                 if not in_replay_mode and not replay_mode_announced:
                     replay_mode_announced = True
                     yield format_sse("stream.mode", {"mode": "live"})
+
+                # Keepalive during silent live periods (e.g. worker cold-start) so the
+                # idle-looking connection isn't closed by an upstream idle timeout.
+                if (time.monotonic() - last_keepalive) >= SSE_KEEPALIVE_INTERVAL:
+                    last_keepalive = time.monotonic()
+                    yield ": keepalive\n\n"
 
                 shutdown_signaled = await connection_manager.wait_or_shutdown(0.5)
                 if shutdown_signaled:
